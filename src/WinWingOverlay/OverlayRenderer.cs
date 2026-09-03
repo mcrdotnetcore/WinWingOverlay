@@ -36,8 +36,12 @@ internal sealed class OverlayRenderer : IDisposable
     private static readonly Color Accent = Color.FromArgb(64, 200, 232);
     private static readonly Color AccentSoft = Color.FromArgb(40, 64, 200, 232);
 
-    private readonly SolidBrush _bg = new(Background);
-    private readonly SolidBrush _panel = new(Panel);
+    // Only these two carry the configurable background alpha. Outlines, grid lines, text and
+    // every live value stay fully opaque, so the readout is legible at any background setting.
+    private SolidBrush _bg = new(Background);
+    private SolidBrush _panel = new(Panel);
+    private int _bgAlpha = 255;
+
     private readonly SolidBrush _text = new(Text);
     private readonly SolidBrush _textDim = new(TextDim);
     private readonly SolidBrush _accent = new(Accent);
@@ -90,16 +94,20 @@ internal sealed class OverlayRenderer : IDisposable
 
     public void Render(Graphics g, Rectangle client, JoystickDevice? device, OverlayConfig config,
         bool locked, bool minimal, string? lockHotkey = null, string? minimalHotkey = null,
-        Size basis = default)
+        Size basis = default, double backgroundAlpha = 1.0)
     {
         if (basis.Width <= 0 || basis.Height <= 0) basis = client.Size;
 
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        // Grayscale AA, not ClearType: subpixel rendering needs an opaque backdrop and would
+        // fringe badly over a translucent background on a layered window.
+        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
         g.InterpolationMode = InterpolationMode.NearestNeighbor;
 
         EnsureFonts(basis.Height);
+        EnsureBackgroundAlpha(backgroundAlpha);
 
+        g.Clear(Color.Transparent);
         g.FillRectangle(_bg, client);
         using (var border = new Pen(locked ? Edge : Accent, locked ? 1f : 2f))
             g.DrawRectangle(border, 0, 0, client.Width - 1, client.Height - 1);
@@ -537,6 +545,18 @@ internal sealed class OverlayRenderer : IDisposable
             if (kv.Value is { Length: > 0 } && kv.Value.Length > _widestLabel.Length)
                 _widestLabel = kv.Value;
         return _widestLabel;
+    }
+
+    private void EnsureBackgroundAlpha(double alpha)
+    {
+        int a = (int)Math.Round(Math.Clamp(alpha, 0.0, 1.0) * 255);
+        if (a == _bgAlpha) return;
+
+        _bgAlpha = a;
+        _bg.Dispose();
+        _panel.Dispose();
+        _bg = new SolidBrush(Color.FromArgb(a, Background));
+        _panel = new SolidBrush(Color.FromArgb(a, Panel));
     }
 
     private void EnsureFonts(int basisHeight)

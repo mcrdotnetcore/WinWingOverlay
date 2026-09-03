@@ -18,6 +18,7 @@ internal sealed class OverlayForm : Form
     private readonly OverlayConfig _config;
     private readonly RawInputManager _input = new();
     private readonly OverlayRenderer _renderer = new();
+    private readonly LayeredSurface _surface = new();
     private readonly System.Windows.Forms.Timer _frameTimer = new();
     private readonly System.Windows.Forms.Timer _topmostTimer = new();
     private readonly NotifyIcon _tray;
@@ -29,6 +30,7 @@ internal sealed class OverlayForm : Form
     private string? _showKey;
     private string? _minimalKey;
 
+    private SettingsForm? _settings;
     private JoystickDevice? _device;
     private bool _dirty = true;
     private int _idleTicks;
@@ -54,7 +56,6 @@ internal sealed class OverlayForm : Form
                  ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
 
         Bounds = ClampToScreens(new Rectangle(config.X, config.Y, config.Width, config.Height));
-        Opacity = Math.Clamp(config.Opacity, 0.15, 1.0);
         Text = "WinWing Overlay";
 
         _frameTimer.Interval = Math.Max(8, 1000 / Math.Clamp(config.MaxFps, 15, 144));
@@ -106,7 +107,7 @@ internal sealed class OverlayForm : Form
             ClientSize = BasisSize;
         }
 
-        Invalidate();
+        Redraw();
     }
 
     protected override CreateParams CreateParams
@@ -114,7 +115,7 @@ internal sealed class OverlayForm : Form
         get
         {
             var cp = base.CreateParams;
-            cp.ExStyle |= Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE;
+            cp.ExStyle |= Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE | Native.WS_EX_LAYERED;
             return cp;
         }
     }
@@ -150,6 +151,7 @@ internal sealed class OverlayForm : Form
         // still reports a caption and border for a borderless form, and a ClientSize set then
         // gets that phantom non-client area folded into it.
         if (_minimal) ApplyMinimalSize();
+        Redraw();
     }
 
     // ---- Hotkeys --------------------------------------------------------
@@ -250,7 +252,7 @@ internal sealed class OverlayForm : Form
         {
             _dirty = false;
             _idleTicks = 0;
-            Invalidate();
+            Redraw();
             return;
         }
 
@@ -259,15 +261,44 @@ internal sealed class OverlayForm : Form
         if (++_idleTicks > 30) _frameTimer.Stop();
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    // The window is a per-pixel layered window: its content is the surface blitted by
+    // Redraw(), so WM_PAINT has nothing to do.
+    protected override void OnPaint(PaintEventArgs e) { }
+
+    protected override void OnPaintBackground(PaintEventArgs e) { }
+
+    /// <summary>
+    /// Background alpha actually used. While unlocked it is floored, because a layered window
+    /// hit-tests by alpha and a fully transparent background would leave nothing to grab.
+    /// </summary>
+    private double EffectiveBackgroundAlpha =>
+        _locked ? _config.BackgroundOpacity : Math.Max(_config.BackgroundOpacity, 0.12);
+
+    /// <summary>Draw a frame and present it. Replaces Invalidate for this window.</summary>
+    private void Redraw()
     {
-        _renderer.Render(e.Graphics, ClientRectangle, _device, _config, _locked, _minimal,
-            _lockKey, _minimalKey, BasisSize);
+        if (!IsHandleCreated || !Visible) return;
+        if (!_surface.Ensure(ClientSize) || _surface.Graphics is null) return;
+
+        _renderer.Render(_surface.Graphics, new Rectangle(Point.Empty, ClientSize), _device, _config,
+            _locked, _minimal, _lockKey, _minimalKey, BasisSize, EffectiveBackgroundAlpha);
+
+        _surface.Present(Handle, (byte)Math.Round(Math.Clamp(_config.Opacity, 0.15, 1.0) * 255));
     }
 
-    protected override void OnPaintBackground(PaintEventArgs e)
+    private void ShowSettings()
     {
-        // Fully covered by OnPaint; skipping this avoids one full-window fill per frame.
+        if (_settings is null || _settings.IsDisposed)
+        {
+            _settings = new SettingsForm(_config, Redraw);
+            _settings.FormClosed += (_, _) => _settings = null;
+            _settings.Show();
+        }
+        else
+        {
+            _settings.Sync();
+            _settings.Activate();
+        }
     }
 
     // ---- Interaction ----------------------------------------------------
@@ -333,8 +364,8 @@ internal sealed class OverlayForm : Form
         if (_locked) return;
         double step = e.Delta > 0 ? 0.05 : -0.05;
         _config.Opacity = Math.Clamp(_config.Opacity + step, 0.15, 1.0);
-        Opacity = _config.Opacity;
-        Invalidate();
+        _settings?.Sync();
+        Redraw();
     }
 
     private void ToggleLock()
@@ -350,6 +381,7 @@ internal sealed class OverlayForm : Form
         if (Visible)
         {
             ReassertTopmost();
+            Redraw();
             _dirty = true;
             _frameTimer.Start();
         }
@@ -392,7 +424,7 @@ internal sealed class OverlayForm : Form
         Cursor = _locked ? Cursors.Default : Cursors.SizeAll;
         _config.Locked = _locked;
         _minimalItem.Enabled = !_locked;
-        Invalidate();
+        Redraw();
         UpdateTrayText();
     }
 
@@ -408,7 +440,7 @@ internal sealed class OverlayForm : Form
     {
         base.OnResize(e);
         Trace($"OnResize: ClientSize={ClientSize} Size={Size} minimal={_minimal}");
-        Invalidate();
+        Redraw();
     }
 
     private void SaveBounds()
@@ -441,6 +473,7 @@ internal sealed class OverlayForm : Form
     {
         var menu = new ContextMenuStrip();
 
+        var opacityItem = new ToolStripMenuItem("Opacity sliders...", null, (_, _) => ShowSettings());
         var resetItem = new ToolStripMenuItem("Reset position", null, (_, _) =>
         {
             var wa = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
@@ -468,7 +501,8 @@ internal sealed class OverlayForm : Form
 
         menu.Items.AddRange(new ToolStripItem[]
         {
-            _lockItem, _showItem, _minimalItem, new ToolStripSeparator(), resetItem, rescanItem, configItem,
+            _lockItem, _showItem, _minimalItem, new ToolStripSeparator(), opacityItem, resetItem,
+            rescanItem, configItem,
             new ToolStripSeparator(), exitItem
         });
 
@@ -507,6 +541,8 @@ internal sealed class OverlayForm : Form
             _topmostTimer.Dispose();
             _tray.Visible = false;
             _tray.Dispose();
+            _settings?.Dispose();
+            _surface.Dispose();
             _renderer.Dispose();
             _input.Dispose();
         }

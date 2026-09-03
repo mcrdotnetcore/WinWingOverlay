@@ -59,7 +59,7 @@ and it never steals focus from the game.
 | `Ctrl+Alt+L` | Lock / unlock. Unlocked = draggable and resizable, and the border turns cyan. |
 | `Ctrl+Alt+O` | Show / hide the overlay. |
 | `Ctrl+Alt+M` | Minimal view — **only works while unlocked**, so it cannot fire by accident mid-flight. |
-| Mouse wheel (unlocked) | Adjust opacity. |
+| Mouse wheel (unlocked) | Adjust overall opacity. |
 
 **Minimal view** drops the button grid, the hat and the RX/RY mini-stick, leaving just X/Y,
 Z and Slider. Change what it hides with `minimalHides`.
@@ -105,8 +105,29 @@ While unlocked in full view: drag anywhere to move, drag within 7 px of any edge
 resize. In minimal view you can drag to move but not resize, because the size is derived. Then
 press `Ctrl+Alt+L` to lock it back down before you fly.
 
-A tray icon gives you Lock/unlock, Show/hide, Reset position, Rescan devices, Open config
-folder and Exit. Position, size, opacity and lock state are saved automatically.
+A tray icon gives you Lock/unlock, Show/hide, Minimal view, Opacity sliders, Reset position,
+Rescan devices, Open config folder and Exit. Position, size, opacity and lock state are saved
+automatically.
+
+## Opacity
+
+Tray icon then **Opacity sliders** gives two independent controls that apply live as you drag:
+
+| Slider | Range | Effect |
+| --- | --- | --- |
+| **Everything** | 15 - 100 % | Fades the whole overlay uniformly, gauges included. |
+| **Background only** | 0 - 100 % | Fades just the dark panel fills. Outlines, grid lines, text and every live value stay solid. |
+
+Set the background low and you get a readable wireframe floating over the game: the crosshair,
+bar outlines, fill level, dot and numbers all survive at 0 %.
+
+This needs per-pixel transparency, which a plain window cannot do, so the overlay is a layered
+window presented with `UpdateLayeredWindow`. It draws into a single reused DIB section, so a
+frame is one draw pass and one blit with no per-frame allocation.
+
+One consequence: Windows hit-tests a layered window by pixel alpha, so a fully transparent
+background would leave nothing to grab. While unlocked the background alpha is therefore floored
+at about 12 % so the overlay stays draggable. Lock it and your real setting applies.
 
 ## Mapping your controls
 
@@ -132,7 +153,8 @@ Work through the grip and base, note the numbers, then label them in the config 
 | Key | Meaning |
 | --- | --- |
 | `x`, `y`, `width`, `height` | Window rectangle. Managed for you while you drag. |
-| `opacity` | 0.15 – 1.0. |
+| `opacity` | Overall, 0.15 - 1.0. Scales every pixel. |
+| `backgroundOpacity` | Panel fills only, 0.0 - 1.0. Outlines, text and live values stay solid. |
 | `locked` | Start locked (click-through). |
 | `vendorId` / `productId` | Which device to show. `16536` is WINWING; `0` means "any". |
 | `buttonCount` | Buttons drawn in the grid. `0` auto-sizes to the 128 the stick declares — set it to `32` or so if you only use the first block and want bigger cells. |
@@ -175,6 +197,8 @@ the hardware, and the overlay shows it as full.
 | `RawInputManager.cs` | Raw Input registration and `WM_INPUT` dispatch. |
 | `OverlayForm.cs` | The window: click-through, hit-testing, hotkeys, tray, frame timing. |
 | `OverlayRenderer.cs` | All drawing. |
+| `LayeredSurface.cs` | The premultiplied ARGB DIB surface behind `UpdateLayeredWindow`. |
+| `SettingsForm.cs` | The opacity sliders. |
 | `OverlayConfig.cs` | JSON settings. |
 | `Hotkey.cs` | Parses "Ctrl+Alt+M" into modifiers and a virtual key. |
 | `DiagRunner.cs` | `--diag` console mode. |

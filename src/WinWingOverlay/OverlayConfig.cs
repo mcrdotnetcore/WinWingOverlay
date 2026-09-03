@@ -17,8 +17,14 @@ internal sealed class OverlayConfig
     public int Width { get; set; } = 460;
     public int Height { get; set; } = 320;
 
-    /// <summary>Window opacity, 0.15 - 1.0.</summary>
+    /// <summary>Opacity of the whole overlay, 0.15 - 1.0. Scales every pixel including the gauges.</summary>
     public double Opacity { get; set; } = 0.82;
+
+    /// <summary>
+    /// Opacity of the dark background and panel fills only, 0.0 - 1.0. Outlines, grid lines,
+    /// text and live values stay solid, so 0 leaves a readable wireframe over the game.
+    /// </summary>
+    public double BackgroundOpacity { get; set; } = 1.0;
 
     /// <summary>When locked the window is click-through and cannot be moved or resized.</summary>
     public bool Locked { get; set; } = true;
