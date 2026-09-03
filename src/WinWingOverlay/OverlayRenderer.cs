@@ -114,14 +114,21 @@ internal sealed class OverlayRenderer : IDisposable
 
         var layout = ComputeLayout(basis, device, config);
 
-        // The title bar is the one thing that follows the real window width, so the
-        // right-aligned hint stays visible after a minimal-view trim.
-        DrawTitle(g, new RectangleF(layout.Pad, layout.Pad * 0.5f, client.Width - layout.Pad * 2, layout.TitleH),
-            device, locked, minimal, lockHotkey, minimalHotkey);
+        // Dropping the title row resizes nothing: the gauges keep their measured size and
+        // simply move up into the space it occupied, and the window is trimmed to match.
+        float shift = HidesTitle(config, minimal) ? -layout.TitleH : 0f;
+
+        if (shift == 0f)
+        {
+            // The title bar is the one thing that follows the real window width, so the
+            // right-aligned hint stays visible after a minimal-view trim.
+            DrawTitle(g, new RectangleF(layout.Pad, layout.Pad * 0.5f, client.Width - layout.Pad * 2, layout.TitleH),
+                device, locked, minimal, lockHotkey, minimalHotkey);
+        }
 
         if (device is null)
         {
-            var msg = new RectangleF(layout.Pad, layout.Body.Y, client.Width - layout.Pad * 2,
+            var msg = new RectangleF(layout.Pad, layout.Body.Y + shift, client.Width - layout.Pad * 2,
                 Math.Max(20f, client.Height - layout.Body.Y - layout.Pad));
             g.DrawString("No joystick detected — plug the stick in, or run with --diag",
                 _fontSmall, _textDim, msg, _centre);
@@ -131,15 +138,15 @@ internal sealed class OverlayRenderer : IDisposable
         var all = BuildItems(device, config, minimal: false);
         var visible = minimal ? BuildItems(device, config, minimal: true) : all;
 
-        var gaugeArea = new RectangleF(layout.Body.X, layout.Body.Y, layout.Body.Width, layout.GaugeH);
+        var gaugeArea = new RectangleF(layout.Body.X, layout.Body.Y + shift, layout.Body.Width, layout.GaugeH);
         var metrics = ComputeMetrics(gaugeArea, all);
 
         if (visible.Count > 0)
-            DrawGauges(g, gaugeArea, device, config, visible, metrics);
+            DrawGauges(g, gaugeArea, device, config, visible, metrics, !HidesLabels(config, minimal));
 
         if (layout.ButtonsInFullView && !Hides(config, minimal, "Buttons"))
         {
-            var grid = new RectangleF(layout.Body.X, layout.Body.Y + layout.GaugeH + layout.Pad * 0.4f,
+            var grid = new RectangleF(layout.Body.X, layout.Body.Y + shift + layout.GaugeH + layout.Pad * 0.4f,
                 layout.Body.Width, layout.Body.Height - layout.GaugeH - layout.Pad * 0.4f);
             if (grid.Height > 8)
                 DrawButtons(g, grid, device.State, ResolveButtonCount(device, config), config);
@@ -171,12 +178,16 @@ internal sealed class OverlayRenderer : IDisposable
             width += (item.Kind == GaugeKind.Bar ? m.BarW : m.Side * item.Factor) + m.Gap;
         width -= m.Gap;
 
+        float shift = HidesTitle(config, minimal: true) ? -layout.TitleH : 0f;
+
         // Keep the full height whenever the button grid survives into minimal view.
         bool buttonsStay = layout.ButtonsInFullView && !Hides(config, minimal: true, "Buttons");
 
         return new Size(
             (int)Math.Ceiling(width + layout.Pad * 2),
-            buttonsStay ? basis.Height : (int)Math.Ceiling(layout.Body.Y + m.Side + layout.Pad * 0.75f));
+            buttonsStay
+                ? (int)Math.Ceiling(basis.Height + shift)
+                : (int)Math.Ceiling(layout.Body.Y + shift + m.Side + layout.Pad * 0.75f));
     }
 
     // ---- Layout ---------------------------------------------------------
@@ -219,6 +230,14 @@ internal sealed class OverlayRenderer : IDisposable
 
         return new GaugeMetrics(side, barW, gap);
     }
+
+    /// <summary>The top row: device name plus the lock/minimal hint.</summary>
+    private static bool HidesTitle(OverlayConfig config, bool minimal) =>
+        Hides(config, minimal, "Title") || Hides(config, minimal, "Text");
+
+    /// <summary>The small captions inside each gauge and the percentage readouts.</summary>
+    private static bool HidesLabels(OverlayConfig config, bool minimal) =>
+        Hides(config, minimal, "Labels");
 
     private static bool Hides(OverlayConfig config, bool minimal, string token) =>
         minimal && config.MinimalHides is { Count: > 0 } &&
@@ -295,13 +314,13 @@ internal sealed class OverlayRenderer : IDisposable
     // ---- Drawing --------------------------------------------------------
 
     private void DrawGauges(Graphics g, RectangleF area, JoystickDevice device, OverlayConfig config,
-        List<GaugeItem> items, GaugeMetrics m)
+        List<GaugeItem> items, GaugeMetrics m, bool labels)
     {
         var state = device.State;
 
         // One font for every bar caption and readout, sized so the widest of them fits.
         Font barFont = _fontTiny;
-        if (items.Any(i => i.Kind == GaugeKind.Bar))
+        if (labels && items.Any(i => i.Kind == GaugeKind.Bar))
         {
             string widest = "100%";
             foreach (var item in items)
@@ -322,24 +341,24 @@ internal sealed class OverlayRenderer : IDisposable
             switch (item.Kind)
             {
                 case GaugeKind.StickXY:
-                    DrawStickBox(g, r, item.Label,
+                    DrawStickBox(g, r, labels ? item.Label : null,
                         Value(state, Native.USAGE_X, 0.5, config),
                         Value(state, Native.USAGE_Y, 0.5, config));
                     break;
 
                 case GaugeKind.StickRXRY:
-                    DrawStickBox(g, r, item.Label,
+                    DrawStickBox(g, r, labels ? item.Label : null,
                         Value(state, Native.USAGE_RX, 0.5, config),
                         Value(state, Native.USAGE_RY, 0.5, config));
                     break;
 
                 case GaugeKind.Hat:
-                    DrawHat(g, r, state.Hat);
+                    DrawHat(g, r, state.Hat, labels);
                     break;
 
                 case GaugeKind.Bar:
-                    DrawBar(g, r, item.Label, Value(state, item.Usage, 0.0, config),
-                        config.ShowAxisReadouts, barFont);
+                    DrawBar(g, r, labels ? item.Label : null, Value(state, item.Usage, 0.0, config),
+                        labels && config.ShowAxisReadouts, barFont);
                     break;
             }
 
@@ -399,7 +418,7 @@ internal sealed class OverlayRenderer : IDisposable
             new RectangleF(r.Right - hintW, r.Y, hintW, r.Height), right);
     }
 
-    private void DrawStickBox(Graphics g, RectangleF r, string label, double nx, double ny)
+    private void DrawStickBox(Graphics g, RectangleF r, string? label, double nx, double ny)
     {
         g.FillRectangle(_panel, r);
         g.DrawRectangle(_edge, r.X, r.Y, r.Width, r.Height);
@@ -421,11 +440,11 @@ internal sealed class OverlayRenderer : IDisposable
         g.FillEllipse(_accentSoft, px - dot * 2.2f, py - dot * 2.2f, dot * 4.4f, dot * 4.4f);
         g.FillEllipse(_accent, px - dot, py - dot, dot * 2, dot * 2);
 
-        if (r.Height > 40)
+        if (label is not null && r.Height > 40)
             g.DrawString(label, _fontTiny, _textDim, r.X + 3, r.Y + 2);
     }
 
-    private void DrawHat(Graphics g, RectangleF r, int hat)
+    private void DrawHat(Graphics g, RectangleF r, int hat, bool label)
     {
         g.FillRectangle(_panel, r);
         g.DrawRectangle(_edge, r.X, r.Y, r.Width, r.Height);
@@ -447,13 +466,13 @@ internal sealed class OverlayRenderer : IDisposable
 
         g.FillEllipse(hat < 0 ? _textDim : _accentSoft, cx - dot * 0.6f, cy - dot * 0.6f, dot * 1.2f, dot * 1.2f);
 
-        if (r.Height > 34)
+        if (label && r.Height > 34)
             g.DrawString("HAT", _fontTiny, _textDim, r.X + 3, r.Y + 2);
     }
 
-    private void DrawBar(Graphics g, RectangleF r, string label, double value, bool readout, Font font)
+    private void DrawBar(Graphics g, RectangleF r, string? label, double value, bool readout, Font font)
     {
-        float labelH = r.Height > 44 ? font.Height + 2f : 0f;
+        float labelH = label is not null && r.Height > 44 ? font.Height + 2f : 0f;
         float readoutH = readout && r.Height > 60 ? font.Height + 2f : 0f;
         var track = new RectangleF(r.X, r.Y + labelH, r.Width, r.Height - labelH - readoutH);
 
@@ -466,7 +485,7 @@ internal sealed class OverlayRenderer : IDisposable
         g.DrawLine(_accentPen, track.X + 1, track.Bottom - fillH, track.Right - 1, track.Bottom - fillH);
 
         if (labelH > 0)
-            g.DrawString(label, font, _textDim, new RectangleF(r.X, r.Y, r.Width, labelH), _centreTight);
+            g.DrawString(label!, font, _textDim, new RectangleF(r.X, r.Y, r.Width, labelH), _centreTight);
         if (readoutH > 0)
             g.DrawString($"{value * 100:0}%", font, _text,
                 new RectangleF(r.X, track.Bottom, r.Width, readoutH), _centreTight);

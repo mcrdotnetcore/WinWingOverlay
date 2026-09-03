@@ -61,8 +61,21 @@ and it never steals focus from the game.
 | `Ctrl+Alt+M` | Minimal view — **only works while unlocked**, so it cannot fire by accident mid-flight. |
 | Mouse wheel (unlocked) | Adjust overall opacity. |
 
-**Minimal view** drops the button grid, the hat and the RX/RY mini-stick, leaving just X/Y,
-Z and Slider. Change what it hides with `minimalHides`.
+**Minimal view** drops the title row, the button grid, the hat and the RX/RY mini-stick,
+leaving just the X/Y box and the Z and Slider bars.
+
+Change what it hides with `minimalHides`. The tokens are:
+
+| Token | Hides |
+| --- | --- |
+| `Title` | The top row: device name and the lock/minimal hint. The gauges move up into the freed space and the window is trimmed to match. |
+| `Labels` | The small captions inside each gauge (`X / Y`, `Z`, `Slider`, `HAT`) and the percentage readouts, for a text-free readout. Off by default. |
+| `Buttons` | The button grid. |
+| `XY`, `RXRY`, `HAT` | Those gauges. |
+| An axis name | That bar, e.g. `Z` or `Slider`. |
+
+With the title hidden the overlay no longer shows its own lock state, so check the tray menu
+if you lose track of it.
 
 It is a **crop, not a rescale**. Layout is always computed from the full-view window size, and
 minimal simply trims the window to the gauges that survive — so every remaining gauge and label
@@ -164,7 +177,7 @@ Work through the grip and base, note the numbers, then label them in the config 
 | `buttonLabels` | Friendly names, e.g. `{ "1": "Trigger", "5": "Pickle" }`. |
 | `gaugeOrder` | Left-to-right gauge order. Default `["XY","Z","Slider","RXRY","HAT"]`. |
 | `invertAxes` | Axes drawn upside down. Defaults to `["Slider"]`. |
-| `minimalHides` | What minimal view hides. Defaults to `["Buttons","HAT","RXRY"]`. |
+| `minimalHides` | What minimal view hides. Defaults to `["Buttons","HAT","RXRY","Title"]`. |
 | `hotkeys` | See "If a hotkey does nothing" above. |
 | `minimal` | Start in minimal view. |
 

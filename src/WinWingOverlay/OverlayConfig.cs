@@ -59,8 +59,11 @@ internal sealed class OverlayConfig
     /// </summary>
     public List<string> InvertAxes { get; set; } = new() { "Slider" };
 
-    /// <summary>What the minimal view hides. Tokens: Buttons, XY, RXRY, HAT, or an axis name.</summary>
-    public List<string> MinimalHides { get; set; } = new() { "Buttons", "HAT", "RXRY" };
+    /// <summary>
+    /// What the minimal view hides. Tokens: Title (the top row), Labels (the small gauge
+    /// captions and percentages), Buttons, XY, RXRY, HAT, or an axis name.
+    /// </summary>
+    public List<string> MinimalHides { get; set; } = new() { "Buttons", "HAT", "RXRY", "Title" };
 
     /// <summary>
     /// Global hotkeys. If a combination is already owned by another program the overlay
