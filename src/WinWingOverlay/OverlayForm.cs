@@ -25,6 +25,9 @@ internal sealed class OverlayForm : Form
     private readonly ToolStripMenuItem _lockItem;
     private readonly ToolStripMenuItem _showItem;
     private readonly ToolStripMenuItem _minimalItem;
+    private readonly ToolStripMenuItem _collectiveItem;
+    private readonly ToolStripMenuItem _menuPageItem;
+    private readonly ToolStripMenuItem _windowListItem;
 
     private string? _lockKey;
     private string? _showKey;
@@ -35,13 +38,16 @@ internal sealed class OverlayForm : Form
     private bool _dirty = true;
     private int _idleTicks;
     private bool _locked;
-    private bool _minimal;
+    private ViewMode _mode;
+    private bool _menuOpen;
+    private string? _dragSlider;
+    private bool _shown;
 
     public OverlayForm(OverlayConfig config)
     {
         _config = config;
         _locked = config.Locked;
-        _minimal = config.Minimal;
+        _mode = config.View;
 
         // Everything is custom-drawn and scaled from the basis size, so WinForms auto-scaling
         // would only fight the measured minimal-view size.
@@ -67,7 +73,11 @@ internal sealed class OverlayForm : Form
 
         _lockItem = new ToolStripMenuItem("Lock / unlock", null, (_, _) => ToggleLock());
         _showItem = new ToolStripMenuItem("Show / hide", null, (_, _) => ToggleVisible());
-        _minimalItem = new ToolStripMenuItem("Minimal view", null, (_, _) => ToggleMinimal());
+        _minimalItem = new ToolStripMenuItem("Minimal view", null, (_, _) => SetMode(ViewMode.Minimal));
+        _collectiveItem = new ToolStripMenuItem("Collective view", null, (_, _) => SetMode(ViewMode.Collective));
+        _menuPageItem = new ToolStripMenuItem("Settings page", null, (_, _) => ToggleMenuPage());
+        _windowListItem = new ToolStripMenuItem("Show in capture window list (OBS)", null,
+            (_, _) => ToggleWindowList());
         _tray = BuildTrayIcon();
     }
 
@@ -91,21 +101,54 @@ internal sealed class OverlayForm : Form
         catch { }
     }
 
-    /// <summary>Resize the window to suit the current mode. Minimal is measured, never guessed.</summary>
-    private void ApplyMinimalSize()
+    /// <summary>
+    /// Resize the window to suit the current view. Everything except Full is measured from the
+    /// basis size, never guessed, so each view is a crop of the same layout.
+    /// </summary>
+    private void ApplyModeSize()
     {
-        if (_minimal)
+        if (!_shown) return;
+
+        Size target;
+
+        if (_menuOpen)
         {
-            var size = _renderer.MeasureMinimal(BasisSize, _device, _config);
-            MinimumSize = new Size(80, MinHeightMinimal);
-            ClientSize = new Size(Math.Max(MinimumSize.Width, size.Width), Math.Max(MinimumSize.Height, size.Height));
-            Trace($"ApplyMinimalSize: basis={BasisSize} measured={size} -> ClientSize={ClientSize} Size={Size}");
+            target = _renderer.MeasureMenu(BasisSize);
         }
         else
         {
-            MinimumSize = new Size(180, MinHeightFull);
-            ClientSize = BasisSize;
+            target = _mode switch
+            {
+                ViewMode.Minimal => _renderer.MeasureMinimal(BasisSize, _device, _config),
+                ViewMode.Collective => CollectiveSize(),
+                _ => BasisSize
+            };
         }
+
+        // Unlocked, the dials get their own strip along the bottom rather than covering a gauge.
+        target.Height += DialStrip;
+
+        // Collective is just a number, so it is allowed to be tiny.
+        var min = _menuOpen
+            ? new Size(80, MinHeightMinimal)
+            : _mode switch
+            {
+                ViewMode.Collective => new Size(48, 30),
+                ViewMode.Minimal => new Size(80, MinHeightMinimal),
+                _ => new Size(180, MinHeightFull)
+            };
+        min.Height += DialStrip;
+        MinimumSize = min;
+
+        ClientSize = new Size(Math.Max(MinimumSize.Width, target.Width),
+            Math.Max(MinimumSize.Height, target.Height));
+
+        Trace($"ApplyModeSize: mode={_mode} menu={_menuOpen} basis={BasisSize} " +
+              $"measured={target} -> ClientSize={ClientSize} handle=0x{Handle.ToInt64():X}");
+
+        // Resizing can rebuild the window handle, and a rebuilt handle comes back with only
+        // the CreateParams styles. Anything set with SetWindowLong has to be re-applied.
+        ApplyClickThrough();
 
         Redraw();
     }
@@ -115,7 +158,12 @@ internal sealed class OverlayForm : Form
         get
         {
             var cp = base.CreateParams;
-            cp.ExStyle |= Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE | Native.WS_EX_LAYERED;
+            cp.ExStyle |= Native.WS_EX_NOACTIVATE | Native.WS_EX_LAYERED;
+
+            // A tool window is hidden from alt-tab, but capture tools skip it too. Omitting
+            // the style is what puts the overlay in the OBS Window Capture list.
+            if (_config?.ShowInWindowList != true) cp.ExStyle |= Native.WS_EX_TOOLWINDOW;
+
             return cp;
         }
     }
@@ -140,6 +188,7 @@ internal sealed class OverlayForm : Form
 
         RegisterHotkeys();
         ApplyLockState();
+        ApplyWindowListStyle();
         _frameTimer.Start();
     }
 
@@ -150,7 +199,8 @@ internal sealed class OverlayForm : Form
         // Size the window only once the frame has settled. During handle creation WinForms
         // still reports a caption and border for a borderless form, and a ClientSize set then
         // gets that phantom non-client area folded into it.
-        if (_minimal) ApplyMinimalSize();
+        _shown = true;
+        ApplyModeSize();
         Redraw();
     }
 
@@ -236,7 +286,7 @@ internal sealed class OverlayForm : Form
         {
             _device = device;
             // The minimal size depends on which gauges the device actually has.
-            if (_minimal) ApplyMinimalSize();
+            if (_mode != ViewMode.Full) ApplyModeSize();
             UpdateTrayText();
         }
         if (device != _device) return;
@@ -281,7 +331,7 @@ internal sealed class OverlayForm : Form
         if (!_surface.Ensure(ClientSize) || _surface.Graphics is null) return;
 
         _renderer.Render(_surface.Graphics, new Rectangle(Point.Empty, ClientSize), _device, _config,
-            _locked, _minimal, _lockKey, _minimalKey, BasisSize, EffectiveBackgroundAlpha);
+            _locked, _mode, _lockKey, _minimalKey, BasisSize, EffectiveBackgroundAlpha, _menuOpen);
 
         _surface.Present(Handle, (byte)Math.Round(Math.Clamp(_config.Opacity, 0.15, 1.0) * 255));
     }
@@ -314,7 +364,7 @@ internal sealed class OverlayForm : Form
             case Native.WM_HOTKEY:
                 if ((int)m.WParam == HotkeyToggleLock) ToggleLock();
                 else if ((int)m.WParam == HotkeyToggleShow) ToggleVisible();
-                else if ((int)m.WParam == HotkeyToggleMinimal) ToggleMinimal();
+                else if ((int)m.WParam == HotkeyToggleMinimal) CycleMode();
                 return;
 
             case Native.WM_MOUSEACTIVATE:
@@ -336,12 +386,15 @@ internal sealed class OverlayForm : Form
 
     private int HitTest(IntPtr lParam)
     {
-        // Minimal view is sized to fit its content, so there is nothing to drag-resize.
-        if (_minimal) return Native.HTCAPTION;
-
         int x = unchecked((short)(long)lParam);
         int y = unchecked((short)((long)lParam >> 16));
         Point p = PointToClient(new Point(x, y));
+
+        // Dials and menu controls must receive real clicks rather than starting a window drag.
+        if (FindHit(p) is not null) return Native.HTCLIENT;
+
+        // The settings page is a fixed layout; every view can be resized.
+        if (_menuOpen) return Native.HTCAPTION;
 
         bool left = p.X <= ResizeBorder;
         bool right = p.X >= ClientSize.Width - ResizeBorder;
@@ -392,38 +445,223 @@ internal sealed class OverlayForm : Form
     }
 
     /// <summary>
-    /// Minimal view drops the button grid and the hat (see <c>minimalHides</c>) and shrinks the
-    /// window to suit. Deliberately only available while unlocked, so it cannot be triggered
-    /// by accident mid-flight.
+    /// Views are only switchable while unlocked, so a stray hotkey cannot change the layout
+    /// mid-flight.
     /// </summary>
-    private void ToggleMinimal()
+    private void CycleMode() => SetMode(_mode switch
+    {
+        ViewMode.Full => ViewMode.Minimal,
+        ViewMode.Minimal => ViewMode.Collective,
+        _ => ViewMode.Full
+    });
+
+    private void SetMode(ViewMode mode)
     {
         if (_locked) return;
 
-        // Leaving full view: remember its size, since it is the basis for both layouts.
-        if (!_minimal)
+        // Leaving Full view: remember its size, since it is the basis for every layout.
+        if (_mode == ViewMode.Full && !_menuOpen)
         {
             _config.Width = Width;
             _config.Height = Height;
         }
 
-        _minimal = !_minimal;
-        _config.Minimal = _minimal;
+        _menuOpen = false;
+        _mode = mode;
+        _config.View = mode;
 
-        ApplyMinimalSize();
+        ApplyModeSize();
         UpdateTrayText();
+        UpdateMenuChecks();
         SaveBounds();
+    }
+
+    /// <summary>The in-overlay settings page, so opacity can be changed without leaving the game.</summary>
+    private void ToggleMenuPage()
+    {
+        if (_locked) return;
+
+        if (!_menuOpen && _mode == ViewMode.Full)
+        {
+            _config.Width = Width;
+            _config.Height = Height;
+        }
+
+        _menuOpen = !_menuOpen;
+
+        ApplyModeSize();
+        UpdateTrayText();
+        UpdateMenuChecks();
+    }
+
+    private void UpdateMenuChecks()
+    {
+        _minimalItem.Checked = !_menuOpen && _mode == ViewMode.Minimal;
+        _collectiveItem.Checked = !_menuOpen && _mode == ViewMode.Collective;
+        _menuPageItem.Checked = _menuOpen;
+    }
+
+    // ---- Clicking the dials and the settings page ------------------------
+
+    private HitRegion? FindHit(Point client)
+    {
+        if (_locked) return null;
+
+        for (int i = _renderer.Hits.Count - 1; i >= 0; i--)
+            if (_renderer.Hits[i].Rect.Contains(client.X, client.Y))
+                return _renderer.Hits[i];
+
+        return null;
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (FindHit(e.Location) is not { } hit) return;
+
+        if (hit.Kind == HitKind.Slider)
+        {
+            _dragSlider = hit.Id;
+            ApplySlider(hit, e.X);
+            return;
+        }
+
+        Activate(hit.Id);
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (_dragSlider is null) return;
+
+        foreach (var hit in _renderer.Hits)
+        {
+            if (hit.Id != _dragSlider) continue;
+            ApplySlider(hit, e.X);
+            return;
+        }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (_dragSlider is null) return;
+
+        _dragSlider = null;
+        _config.Save();
+    }
+
+    private void ApplySlider(HitRegion hit, int x)
+    {
+        double t = Math.Clamp((x - hit.Rect.X) / Math.Max(1f, hit.Rect.Width), 0.0, 1.0);
+
+        if (hit.Id == "opacity") _config.Opacity = Math.Clamp(t, 0.15, 1.0);
+        else _config.BackgroundOpacity = t;
+
+        _settings?.Sync();
+        Redraw();
+    }
+
+    private void Activate(string id)
+    {
+        switch (id)
+        {
+            case "mode:full": SetMode(ViewMode.Full); break;
+            case "mode:minimal": SetMode(ViewMode.Minimal); break;
+            case "mode:collective": SetMode(ViewMode.Collective); break;
+            case "menu": ToggleMenuPage(); break;
+
+            case "collective:percent":
+                _config.CollectiveShowPercent = !_config.CollectiveShowPercent;
+                SaveAndRefresh();
+                break;
+
+            case "dials":
+                _config.ShowDials = !_config.ShowDials;
+                SaveAndRefresh();
+                break;
+
+            case "obs": ToggleWindowList(); Redraw(); break;
+            case "buttons": _config.ShowButtons = !_config.ShowButtons; SaveAndRefresh(); break;
+            case "readouts": _config.ShowAxisReadouts = !_config.ShowAxisReadouts; SaveAndRefresh(); break;
+
+            case "lock": _menuOpen = false; ApplyModeSize(); ToggleLock(); break;
+            case "reset": ResetPosition(); break;
+            case "rescan": RescanDevices(); break;
+            case "config": OpenConfigFolder(); break;
+            case "exit": Close(); break;
+        }
+    }
+
+    /// <summary>Anything that changes what is drawn can also change the measured size.</summary>
+    private void SaveAndRefresh()
+    {
+        _config.Save();
+        ApplyModeSize();
+    }
+
+    private void ToggleWindowList()
+    {
+        _config.ShowInWindowList = !_config.ShowInWindowList;
+        ApplyWindowListStyle();
+        _config.Save();
+    }
+
+    /// <summary>
+    /// Add or remove WS_EX_TOOLWINDOW. The shell and capture tools only re-read this style
+    /// when a window is shown, so the visibility is cycled rather than asking for a restart.
+    /// </summary>
+    private void ApplyWindowListStyle()
+    {
+        _windowListItem.Checked = _config.ShowInWindowList;
+        if (!IsHandleCreated) return;
+
+        bool wasVisible = Visible;
+        if (wasVisible) Visible = false;
+
+        int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
+        ex = _config.ShowInWindowList
+            ? ex & ~Native.WS_EX_TOOLWINDOW
+            : ex | Native.WS_EX_TOOLWINDOW;
+        Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, ex);
+
+        if (!wasVisible) return;
+
+        Visible = true;
+        ReassertTopmost();
+        Redraw();
+    }
+
+    /// <summary>
+    /// Locked means click-through: WS_EX_TRANSPARENT lets the game receive the mouse. Kept in
+    /// its own method because it must be re-applied after anything that resizes the window.
+    /// </summary>
+    private void ApplyClickThrough()
+    {
+        if (!IsHandleCreated) return;
+
+        int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
+        int wanted = _locked ? ex | Native.WS_EX_TRANSPARENT : ex & ~Native.WS_EX_TRANSPARENT;
+        if (wanted != ex) Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, wanted);
     }
 
     private void ApplyLockState()
     {
-        int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
-        ex = _locked ? ex | Native.WS_EX_TRANSPARENT : ex & ~Native.WS_EX_TRANSPARENT;
-        Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, ex);
+        ApplyClickThrough();
 
         Cursor = _locked ? Cursors.Default : Cursors.SizeAll;
         _config.Locked = _locked;
+        ApplyModeSize();
         _minimalItem.Enabled = !_locked;
+        _collectiveItem.Enabled = !_locked;
+        _menuPageItem.Enabled = !_locked;
+
+        // The settings page is only reachable while unlocked; locking closes it.
+        if (_locked && _menuOpen)
+        {
+            _menuOpen = false;
+            ApplyModeSize();
+        }
         Redraw();
         UpdateTrayText();
     }
@@ -435,11 +673,77 @@ internal sealed class OverlayForm : Form
             Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
     }
 
-    protected override void OnResizeEnd(EventArgs e) { base.OnResizeEnd(e); SaveBounds(); }
+    protected override void OnResizeEnd(EventArgs e)
+    {
+        base.OnResizeEnd(e);
+
+        if (!_menuOpen && _mode == ViewMode.Collective)
+        {
+            // Collective is just a number in a box, so it keeps whatever size you drag and the
+            // number scales to fill it. No snapping.
+            var size = ClientSize;
+            size.Height -= DialStrip;
+            if (size.Width >= 20 && size.Height >= 16)
+            {
+                _config.CollectiveWidth = size.Width;
+                _config.CollectiveHeight = size.Height;
+            }
+        }
+        else if (!_menuOpen && _mode == ViewMode.Minimal)
+        {
+            // Minimal is a crop of the Full layout, so a drag has to change the basis rather
+            // than the window. Back-solve one that measures near the dragged size, then snap.
+            RebaseFromCurrentSize();
+            ApplyModeSize();
+        }
+
+        SaveBounds();
+    }
+
+    /// <summary>Height the dial bar occupies right now, or zero when it is not being drawn.</summary>
+    private int DialStrip => !_locked && !_menuOpen && _config.ShowDials
+        ? (int)Math.Ceiling(_renderer.DialStripHeight(BasisSize))
+        : 0;
+
+    /// <summary>Collective keeps a size of its own once dragged; otherwise it is derived.</summary>
+    private Size CollectiveSize() =>
+        _config.CollectiveWidth > 0 && _config.CollectiveHeight > 0
+            ? new Size(_config.CollectiveWidth, _config.CollectiveHeight)
+            : _renderer.MeasureCollective(BasisSize, _config);
+
+    private Size MeasureFor(ViewMode mode, Size basis) => mode switch
+    {
+        ViewMode.Minimal => _renderer.MeasureMinimal(basis, _device, _config),
+        ViewMode.Collective => _renderer.MeasureCollective(basis, _config),
+        _ => basis
+    };
+
+    private void RebaseFromCurrentSize()
+    {
+        var target = ClientSize;
+        target.Height -= DialStrip;
+        if (target.Width < 40 || target.Height < 30) return;
+
+        var basis = BasisSize;
+
+        // The measurement is not linear in the basis, so converge on it instead of inverting it.
+        for (int i = 0; i < 4; i++)
+        {
+            var measured = MeasureFor(_mode, basis);
+            if (measured.Width <= 0 || measured.Height <= 0) break;
+
+            basis = new Size(
+                Math.Clamp((int)Math.Round(basis.Width * (double)target.Width / measured.Width), 220, 4000),
+                Math.Clamp((int)Math.Round(basis.Height * (double)target.Height / measured.Height), 160, 3000));
+        }
+
+        _config.Width = basis.Width;
+        _config.Height = basis.Height;
+    }
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        Trace($"OnResize: ClientSize={ClientSize} Size={Size} minimal={_minimal}");
+        Trace($"OnResize: ClientSize={ClientSize} Size={Size} mode={_mode} menu={_menuOpen}");
         Redraw();
     }
 
@@ -448,13 +752,41 @@ internal sealed class OverlayForm : Form
         if (WindowState != FormWindowState.Normal) return;
         _config.X = Bounds.X;
         _config.Y = Bounds.Y;
-        // Minimal size is derived, never stored: only the full view defines the basis.
-        if (!_minimal)
+        // Every other view is derived, never stored: only Full view defines the basis.
+        if (_mode == ViewMode.Full && !_menuOpen)
         {
             _config.Width = Bounds.Width;
             _config.Height = Bounds.Height;
         }
         _config.Save();
+    }
+
+    private void ResetPosition()
+    {
+        var wa = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
+        _config.Width = 460;
+        _config.Height = 320;
+        _config.CollectiveWidth = 0;
+        _config.CollectiveHeight = 0;
+        Location = new Point(wa.X + 40, wa.Y + 40);
+        ApplyModeSize();
+        SaveBounds();
+    }
+
+    private void RescanDevices()
+    {
+        _input.RefreshDevices();
+        SelectDevice();
+        ApplyModeSize();
+        _dirty = true;
+        _frameTimer.Start();
+    }
+
+    private void OpenConfigFolder()
+    {
+        _config.Save();
+        var dir = Path.GetDirectoryName(OverlayConfig.Path)!;
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true });
     }
 
     private static Rectangle ClampToScreens(Rectangle r)
@@ -474,35 +806,15 @@ internal sealed class OverlayForm : Form
         var menu = new ContextMenuStrip();
 
         var opacityItem = new ToolStripMenuItem("Opacity sliders...", null, (_, _) => ShowSettings());
-        var resetItem = new ToolStripMenuItem("Reset position", null, (_, _) =>
-        {
-            var wa = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
-            _config.Width = 460;
-            _config.Height = 320;
-            Location = new Point(wa.X + 40, wa.Y + 40);
-            ApplyMinimalSize();
-            SaveBounds();
-        });
-        var rescanItem = new ToolStripMenuItem("Rescan devices", null, (_, _) =>
-        {
-            _input.RefreshDevices();
-            SelectDevice();
-            if (_minimal) ApplyMinimalSize();
-            _dirty = true;
-            _frameTimer.Start();
-        });
-        var configItem = new ToolStripMenuItem("Open config folder", null, (_, _) =>
-        {
-            _config.Save();
-            var dir = Path.GetDirectoryName(OverlayConfig.Path)!;
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true });
-        });
+        var resetItem = new ToolStripMenuItem("Reset position", null, (_, _) => ResetPosition());
+        var rescanItem = new ToolStripMenuItem("Rescan devices", null, (_, _) => RescanDevices());
+        var configItem = new ToolStripMenuItem("Open config folder", null, (_, _) => OpenConfigFolder());
         var exitItem = new ToolStripMenuItem("Exit", null, (_, _) => Close());
 
         menu.Items.AddRange(new ToolStripItem[]
         {
-            _lockItem, _showItem, _minimalItem, new ToolStripSeparator(), opacityItem, resetItem,
-            rescanItem, configItem,
+            _lockItem, _showItem, _minimalItem, _collectiveItem, new ToolStripSeparator(),
+            _menuPageItem, opacityItem, _windowListItem, resetItem, rescanItem, configItem,
             new ToolStripSeparator(), exitItem
         });
 
@@ -519,7 +831,7 @@ internal sealed class OverlayForm : Form
     private void UpdateTrayText()
     {
         string name = _device?.DisplayName ?? "no device";
-        string mode = (_locked ? "locked" : "unlocked") + (_minimal ? ", minimal" : "");
+        string mode = (_locked ? "locked" : "unlocked") + ", " + _mode.ToString().ToLowerInvariant();
         string text = $"WinWing Overlay — {mode} — {name}";
         _tray.Text = text.Length > 63 ? text[..63] : text;
     }

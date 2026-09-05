@@ -60,6 +60,18 @@ internal sealed class OverlayConfig
     public List<string> InvertAxes { get; set; } = new() { "Slider" };
 
     /// <summary>
+    /// Axes drawn as a full-width horizontal bar beneath the gauge row rather than as a
+    /// vertical bar inside it. Suits a yaw / rudder axis, which reads naturally left-right.
+    /// </summary>
+    public List<string> BottomBars { get; set; } = new() { "Z" };
+
+    /// <summary>
+    /// Bars that fill outward from their centre instead of from the bottom or left edge,
+    /// with a signed readout. Suits a self-centring axis such as twist rudder.
+    /// </summary>
+    public List<string> CentreOrigin { get; set; } = new() { "Z" };
+
+    /// <summary>
     /// What the minimal view hides. Tokens: Title (the top row), Labels (the small gauge
     /// captions and percentages), Buttons, XY, RXRY, HAT, or an axis name.
     /// </summary>
@@ -71,8 +83,62 @@ internal sealed class OverlayConfig
     /// </summary>
     public HotkeyConfig Hotkeys { get; set; } = new();
 
-    /// <summary>Start in minimal view.</summary>
+    /// <summary>Start in minimal view. Superseded by <see cref="Mode"/>; kept so old configs still work.</summary>
     public bool Minimal { get; set; }
+
+    /// <summary>Current view: Full, Minimal or Collective.</summary>
+    public string Mode { get; set; } = "";
+
+    /// <summary>
+    /// Whether the F / M / C dial bar is drawn while unlocked. The small corner button toggles
+    /// it, and that button stays visible so the bar can always be brought back.
+    /// </summary>
+    public bool ShowDials { get; set; } = true;
+
+    /// <summary>Axis shown in Collective mode, by name.</summary>
+    public string CollectiveAxis { get; set; } = "Slider";
+
+    /// <summary>
+    /// Whether Collective view draws the % symbol. The value is a percentage either way;
+    /// turning this off with the corner button leaves just the bare number.
+    /// </summary>
+    public bool CollectiveShowPercent { get; set; } = true;
+
+    /// <summary>
+    /// Collective view size once it has been resized by hand. 0 derives one from the basis.
+    /// Unlike the other views it keeps its own size, because the number simply scales to fill
+    /// whatever box you drag.
+    /// </summary>
+    public int CollectiveWidth { get; set; }
+    public int CollectiveHeight { get; set; }
+
+    /// <summary>Collective mode colours, as HTML hex.</summary>
+    public string CollectiveBackground { get; set; } = "#101E3A";
+    public string CollectiveText { get; set; } = "#FFFFFF";
+
+    /// <summary>
+    /// The view, resolved from <see cref="Mode"/> and falling back to the legacy
+    /// <see cref="Minimal"/> flag so a config written by an older build still opens correctly.
+    /// </summary>
+    [JsonIgnore]
+    public ViewMode View
+    {
+        get => Enum.TryParse(Mode, ignoreCase: true, out ViewMode parsed)
+            ? parsed
+            : (Minimal ? ViewMode.Minimal : ViewMode.Full);
+        set
+        {
+            Mode = value.ToString();
+            Minimal = value == ViewMode.Minimal;
+        }
+    }
+
+    /// <summary>
+    /// Drop WS_EX_TOOLWINDOW so screen-capture tools list the overlay. OBS filters tool
+    /// windows out of its Window Capture picker. The window is owned by a hidden parent
+    /// either way, so it stays off the taskbar and out of alt-tab.
+    /// </summary>
+    public bool ShowInWindowList { get; set; }
 
     [JsonIgnore]
     public static string Path { get; } = System.IO.Path.Combine(

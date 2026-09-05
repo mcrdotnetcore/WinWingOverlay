@@ -12,7 +12,7 @@ namespace WinWingOverlay;
 /// every remaining gauge and label keeps exactly the size and position it had in full view.
 /// Minimal is a crop, not a rescale.
 /// </summary>
-internal sealed class OverlayRenderer : IDisposable
+internal sealed partial class OverlayRenderer : IDisposable
 {
     private enum GaugeKind { StickXY, StickRXRY, Hat, Bar }
 
@@ -74,6 +74,10 @@ internal sealed class OverlayRenderer : IDisposable
 
     private HashSet<string>? _invert;
     private List<string>? _invertSource;
+    private HashSet<string>? _bottom;
+    private List<string>? _bottomSource;
+    private HashSet<string>? _centreOrigin;
+    private List<string>? _centreOriginSource;
 
     private readonly StringFormat _centre = new()
     {
@@ -90,13 +94,29 @@ internal sealed class OverlayRenderer : IDisposable
         FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip
     };
 
+    private readonly StringFormat _leftTight = new(StringFormat.GenericTypographic)
+    {
+        Alignment = StringAlignment.Near,
+        LineAlignment = StringAlignment.Center,
+        FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip
+    };
+
+    private readonly StringFormat _rightTight = new(StringFormat.GenericTypographic)
+    {
+        Alignment = StringAlignment.Far,
+        LineAlignment = StringAlignment.Center,
+        FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip
+    };
+
     // ---- Public surface -------------------------------------------------
 
     public void Render(Graphics g, Rectangle client, JoystickDevice? device, OverlayConfig config,
-        bool locked, bool minimal, string? lockHotkey = null, string? minimalHotkey = null,
-        Size basis = default, double backgroundAlpha = 1.0)
+        bool locked, ViewMode mode, string? lockHotkey = null, string? modeHotkey = null,
+        Size basis = default, double backgroundAlpha = 1.0, bool menuOpen = false)
     {
         if (basis.Width <= 0 || basis.Height <= 0) basis = client.Size;
+
+        bool minimal = mode == ViewMode.Minimal;
 
         g.SmoothingMode = SmoothingMode.AntiAlias;
         // Grayscale AA, not ClearType: subpixel rendering needs an opaque backdrop and would
@@ -106,8 +126,28 @@ internal sealed class OverlayRenderer : IDisposable
 
         EnsureFonts(basis.Height);
         EnsureBackgroundAlpha(backgroundAlpha);
+        Hits.Clear();
 
         g.Clear(Color.Transparent);
+
+        if (menuOpen)
+        {
+            DrawMenuPage(g, client, config, basis, locked);
+            DrawDials(g, client, mode, menuOpen: true, basis);
+            return;
+        }
+
+        bool dials = !locked && config.ShowDials;
+
+        if (mode == ViewMode.Collective)
+        {
+            DrawCollective(g, client, device, config, basis, locked, backgroundAlpha,
+                dials ? DialStripHeight(basis) : 0f);
+            if (dials) DrawDials(g, client, mode, menuOpen: false, basis);
+            if (!locked) DrawChromeToggle(g, client, config, basis);
+            return;
+        }
+
         g.FillRectangle(_bg, client);
         using (var border = new Pen(locked ? Edge : Accent, locked ? 1f : 2f))
             g.DrawRectangle(border, 0, 0, client.Width - 1, client.Height - 1);
@@ -123,7 +163,7 @@ internal sealed class OverlayRenderer : IDisposable
             // The title bar is the one thing that follows the real window width, so the
             // right-aligned hint stays visible after a minimal-view trim.
             DrawTitle(g, new RectangleF(layout.Pad, layout.Pad * 0.5f, client.Width - layout.Pad * 2, layout.TitleH),
-                device, locked, minimal, lockHotkey, minimalHotkey);
+                device, locked, mode, lockHotkey, modeHotkey);
         }
 
         if (device is null)
@@ -132,6 +172,8 @@ internal sealed class OverlayRenderer : IDisposable
                 Math.Max(20f, client.Height - layout.Body.Y - layout.Pad));
             g.DrawString("No joystick detected — plug the stick in, or run with --diag",
                 _fontSmall, _textDim, msg, _centre);
+            if (dials) DrawDials(g, client, mode, menuOpen: false, basis);
+            if (!locked) DrawChromeToggle(g, client, config, basis);
             return;
         }
 
@@ -141,16 +183,47 @@ internal sealed class OverlayRenderer : IDisposable
         var gaugeArea = new RectangleF(layout.Body.X, layout.Body.Y + shift, layout.Body.Width, layout.GaugeH);
         var metrics = ComputeMetrics(gaugeArea, all);
 
+        bool labels = !HidesLabels(config, minimal);
+
         if (visible.Count > 0)
-            DrawGauges(g, gaugeArea, device, config, visible, metrics, !HidesLabels(config, minimal));
+            DrawGauges(g, gaugeArea, device, config, visible, metrics, labels);
+
+        float rowBottom = gaugeArea.Y + metrics.Side;
+        var bottomBars = BuildBottomBars(device, config, minimal);
+
+        if (bottomBars.Count > 0)
+        {
+            float rowWidth = RowWidth(visible, metrics);
+            if (rowWidth < 8f) rowWidth = gaugeArea.Width;
+
+            float thickness = BottomBarThickness(metrics);
+            float y = rowBottom + metrics.Gap;
+
+            foreach (var item in bottomBars)
+            {
+                bool centre = CentreOriginSet(config).Contains(item.Label);
+                DrawHBar(g, new RectangleF(gaugeArea.X, y, rowWidth, thickness),
+                    labels ? item.Label : null,
+                    Value(device.State, item.Usage, centre ? 0.5 : 0.0, config),
+                    labels && config.ShowAxisReadouts, centre, _fontTiny);
+                y += thickness + metrics.Gap;
+            }
+
+            rowBottom = y - metrics.Gap;
+        }
 
         if (layout.ButtonsInFullView && !Hides(config, minimal, "Buttons"))
         {
-            var grid = new RectangleF(layout.Body.X, layout.Body.Y + shift + layout.GaugeH + layout.Pad * 0.4f,
-                layout.Body.Width, layout.Body.Height - layout.GaugeH - layout.Pad * 0.4f);
+            float top = Math.Max(layout.Body.Y + shift + layout.GaugeH + layout.Pad * 0.4f,
+                rowBottom + layout.Pad * 0.4f);
+            var grid = new RectangleF(layout.Body.X, top, layout.Body.Width,
+                layout.Body.Y + shift + layout.Body.Height - top);
             if (grid.Height > 8)
                 DrawButtons(g, grid, device.State, ResolveButtonCount(device, config), config);
         }
+
+        if (dials) DrawDials(g, client, mode, menuOpen: false, basis);
+        if (!locked) DrawChromeToggle(g, client, config, basis);
     }
 
     /// <summary>
@@ -173,12 +246,12 @@ internal sealed class OverlayRenderer : IDisposable
         var gaugeArea = new RectangleF(layout.Body.X, layout.Body.Y, layout.Body.Width, layout.GaugeH);
         var m = ComputeMetrics(gaugeArea, all);
 
-        float width = 0f;
-        foreach (var item in visible)
-            width += (item.Kind == GaugeKind.Bar ? m.BarW : m.Side * item.Factor) + m.Gap;
-        width -= m.Gap;
+        float width = RowWidth(visible, m);
 
         float shift = HidesTitle(config, minimal: true) ? -layout.TitleH : 0f;
+
+        int bars = BuildBottomBars(device, config, minimal: true).Count;
+        float bottomHeight = bars * (BottomBarThickness(m) + m.Gap);
 
         // Keep the full height whenever the button grid survives into minimal view.
         bool buttonsStay = layout.ButtonsInFullView && !Hides(config, minimal: true, "Buttons");
@@ -187,7 +260,7 @@ internal sealed class OverlayRenderer : IDisposable
             (int)Math.Ceiling(width + layout.Pad * 2),
             buttonsStay
                 ? (int)Math.Ceiling(basis.Height + shift)
-                : (int)Math.Ceiling(layout.Body.Y + shift + m.Side + layout.Pad * 0.75f));
+                : (int)Math.Ceiling(layout.Body.Y + shift + m.Side + bottomHeight + layout.Pad * 0.75f));
     }
 
     // ---- Layout ---------------------------------------------------------
@@ -243,9 +316,10 @@ internal sealed class OverlayRenderer : IDisposable
         minimal && config.MinimalHides is { Count: > 0 } &&
         config.MinimalHides.Any(h => string.Equals(h?.Trim(), token, StringComparison.OrdinalIgnoreCase));
 
-    private static List<GaugeItem> BuildItems(JoystickDevice device, OverlayConfig config, bool minimal)
+    private List<GaugeItem> BuildItems(JoystickDevice device, OverlayConfig config, bool minimal)
     {
         var present = new HashSet<ushort>(device.Axes.Select(a => a.Usage));
+        var bottom = BottomSet(config);
         var order = config.GaugeOrder is { Count: > 0 }
             ? config.GaugeOrder
             : new List<string> { "XY", "Z", "Slider", "RXRY", "HAT" };
@@ -278,7 +352,8 @@ internal sealed class OverlayRenderer : IDisposable
 
                 default:
                     ushort usage = BarUsageFor(token);
-                    if (usage != 0 && present.Contains(usage) && placedBars.Add(usage))
+                    if (usage == 0 || bottom.Contains(AxisInfo.NameFor(usage))) break;
+                    if (present.Contains(usage) && placedBars.Add(usage))
                         items.Add(new GaugeItem(GaugeKind.Bar, usage, AxisInfo.NameFor(usage), 0f));
                     break;
             }
@@ -288,6 +363,7 @@ internal sealed class OverlayRenderer : IDisposable
         foreach (ushort usage in BarUsages)
         {
             if (!present.Contains(usage) || placedBars.Contains(usage)) continue;
+            if (bottom.Contains(AxisInfo.NameFor(usage))) continue;
             if (Hides(config, minimal, AxisInfo.NameFor(usage))) continue;
             items.Add(new GaugeItem(GaugeKind.Bar, usage, AxisInfo.NameFor(usage), 0f));
         }
@@ -304,6 +380,41 @@ internal sealed class OverlayRenderer : IDisposable
         "WHEEL" => Native.USAGE_WHEEL,
         _ => (ushort)0
     };
+
+    /// <summary>Axes pulled out of the row and drawn full width underneath it.</summary>
+    private List<GaugeItem> BuildBottomBars(JoystickDevice device, OverlayConfig config, bool minimal)
+    {
+        var items = new List<GaugeItem>();
+        if (config.BottomBars is not { Count: > 0 }) return items;
+
+        var present = new HashSet<ushort>(device.Axes.Select(a => a.Usage));
+        var placed = new HashSet<ushort>();
+
+        foreach (string? raw in config.BottomBars)
+        {
+            string token = raw?.Trim() ?? "";
+            if (token.Length == 0 || Hides(config, minimal, token)) continue;
+
+            ushort usage = BarUsageFor(token);
+            if (usage == 0 || !present.Contains(usage) || !placed.Add(usage)) continue;
+
+            items.Add(new GaugeItem(GaugeKind.Bar, usage, AxisInfo.NameFor(usage), 0f));
+        }
+
+        return items;
+    }
+
+    /// <summary>Width the visible row actually occupies, which the bottom bars span.</summary>
+    private static float RowWidth(List<GaugeItem> items, GaugeMetrics m)
+    {
+        if (items.Count == 0) return 0f;
+        float width = 0f;
+        foreach (var item in items)
+            width += (item.Kind == GaugeKind.Bar ? m.BarW : m.Side * item.Factor) + m.Gap;
+        return width - m.Gap;
+    }
+
+    private static float BottomBarThickness(GaugeMetrics m) => Math.Clamp(m.Side * 0.14f, 14f, 34f);
 
     private static int ResolveButtonCount(JoystickDevice device, OverlayConfig config)
     {
@@ -357,8 +468,10 @@ internal sealed class OverlayRenderer : IDisposable
                     break;
 
                 case GaugeKind.Bar:
-                    DrawBar(g, r, labels ? item.Label : null, Value(state, item.Usage, 0.0, config),
-                        labels && config.ShowAxisReadouts, barFont);
+                    bool centred = CentreOriginSet(config).Contains(item.Label);
+                    DrawBar(g, r, labels ? item.Label : null,
+                        Value(state, item.Usage, centred ? 0.5 : 0.0, config),
+                        labels && config.ShowAxisReadouts, centred, barFont);
                     break;
             }
 
@@ -378,21 +491,47 @@ internal sealed class OverlayRenderer : IDisposable
         if (_invert is null || !ReferenceEquals(_invertSource, config.InvertAxes))
         {
             _invertSource = config.InvertAxes;
-            _invert = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string? name in config.InvertAxes ?? new List<string>())
-                if (!string.IsNullOrWhiteSpace(name)) _invert.Add(name.Trim());
+            _invert = NameSet(config.InvertAxes);
         }
         return _invert;
     }
 
-    private void DrawTitle(Graphics g, RectangleF r, JoystickDevice? device, bool locked, bool minimal,
-        string? lockHotkey, string? minimalHotkey)
+    private HashSet<string> BottomSet(OverlayConfig config)
+    {
+        if (_bottom is null || !ReferenceEquals(_bottomSource, config.BottomBars))
+        {
+            _bottomSource = config.BottomBars;
+            _bottom = NameSet(config.BottomBars);
+        }
+        return _bottom;
+    }
+
+    private HashSet<string> CentreOriginSet(OverlayConfig config)
+    {
+        if (_centreOrigin is null || !ReferenceEquals(_centreOriginSource, config.CentreOrigin))
+        {
+            _centreOriginSource = config.CentreOrigin;
+            _centreOrigin = NameSet(config.CentreOrigin);
+        }
+        return _centreOrigin;
+    }
+
+    private static HashSet<string> NameSet(List<string>? names)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string? name in names ?? new List<string>())
+            if (!string.IsNullOrWhiteSpace(name)) set.Add(name.Trim());
+        return set;
+    }
+
+    private void DrawTitle(Graphics g, RectangleF r, JoystickDevice? device, bool locked, ViewMode mode,
+        string? lockHotkey, string? modeHotkey)
     {
         string lockKey = lockHotkey ?? "tray menu";
-        string minKey = minimalHotkey ?? "tray menu";
+        string modeKey = modeHotkey ?? "tray menu";
         string hint = locked
-            ? (minimal ? $"MINIMAL · LOCKED  {lockKey}" : $"LOCKED  {lockKey}")
-            : (minimal ? $"UNLOCKED · {minKey} full" : $"UNLOCKED · {minKey} minimal");
+            ? (mode == ViewMode.Full ? $"LOCKED  {lockKey}" : $"{mode.ToString().ToUpperInvariant()} · LOCKED  {lockKey}")
+            : $"UNLOCKED · {modeKey} mode";
 
         // Give the hint exactly the room it needs, so trimming the window does not clip it.
         float hintW = Math.Min(
@@ -470,7 +609,8 @@ internal sealed class OverlayRenderer : IDisposable
             g.DrawString("HAT", _fontTiny, _textDim, r.X + 3, r.Y + 2);
     }
 
-    private void DrawBar(Graphics g, RectangleF r, string? label, double value, bool readout, Font font)
+    private void DrawBar(Graphics g, RectangleF r, string? label, double value, bool readout,
+        bool centreOrigin, Font font)
     {
         float labelH = label is not null && r.Height > 44 ? font.Height + 2f : 0f;
         float readoutH = readout && r.Height > 60 ? font.Height + 2f : 0f;
@@ -479,17 +619,67 @@ internal sealed class OverlayRenderer : IDisposable
         g.FillRectangle(_panel, track);
         g.DrawRectangle(_edge, track.X, track.Y, track.Width, track.Height);
 
-        float fillH = (float)(value * track.Height);
-        if (fillH > 0.5f)
-            g.FillRectangle(_accentSoft, new RectangleF(track.X + 1, track.Bottom - fillH, track.Width - 1, fillH));
-        g.DrawLine(_accentPen, track.X + 1, track.Bottom - fillH, track.Right - 1, track.Bottom - fillH);
+        float y = track.Bottom - (float)(Math.Clamp(value, 0.0, 1.0) * track.Height);
+        float origin = centreOrigin ? track.Y + track.Height / 2f : track.Bottom;
+
+        if (centreOrigin)
+            g.DrawLine(_gridPen, track.X + 1, origin, track.Right - 1, origin);
+
+        float top = Math.Min(origin, y);
+        float height = Math.Abs(origin - y);
+        if (height > 0.5f)
+            g.FillRectangle(_accentSoft, new RectangleF(track.X + 1, top, track.Width - 1, height));
+        g.DrawLine(_accentPen, track.X + 1, y, track.Right - 1, y);
 
         if (labelH > 0)
             g.DrawString(label!, font, _textDim, new RectangleF(r.X, r.Y, r.Width, labelH), _centreTight);
         if (readoutH > 0)
-            g.DrawString($"{value * 100:0}%", font, _text,
+            g.DrawString(Readout(value, centreOrigin), font, _text,
                 new RectangleF(r.X, track.Bottom, r.Width, readoutH), _centreTight);
     }
+
+    /// <summary>
+    /// A full-width horizontal bar: caption on the left, track in the middle, readout on the
+    /// right. With <paramref name="centreOrigin"/> the fill grows from the centre tick towards
+    /// whichever side the axis has moved, which is how a yaw axis reads naturally.
+    /// </summary>
+    private void DrawHBar(Graphics g, RectangleF r, string? label, double value, bool readout,
+        bool centreOrigin, Font font)
+    {
+        float labelW = label is null ? 0f : MeasureText(g, label, font) + 6f;
+        float readoutW = readout ? MeasureText(g, centreOrigin ? "-100%" : "100%", font) + 6f : 0f;
+
+        var track = new RectangleF(r.X + labelW, r.Y,
+            Math.Max(8f, r.Width - labelW - readoutW), r.Height);
+
+        g.FillRectangle(_panel, track);
+        g.DrawRectangle(_edge, track.X, track.Y, track.Width, track.Height);
+
+        float x = track.X + (float)(Math.Clamp(value, 0.0, 1.0) * track.Width);
+        float origin = centreOrigin ? track.X + track.Width / 2f : track.X;
+
+        if (centreOrigin)
+            g.DrawLine(_gridPen, origin, track.Y + 1, origin, track.Bottom - 1);
+
+        float left = Math.Min(origin, x);
+        float width = Math.Abs(origin - x);
+        if (width > 0.5f)
+            g.FillRectangle(_accentSoft, new RectangleF(left, track.Y + 1, width, track.Height - 1));
+        g.DrawLine(_accentPen, x, track.Y + 1, x, track.Bottom - 1);
+
+        if (label is not null)
+            g.DrawString(label, font, _textDim, new RectangleF(r.X, r.Y, labelW, r.Height), _leftTight);
+        if (readout)
+            g.DrawString(Readout(value, centreOrigin), font, _text,
+                new RectangleF(track.Right, r.Y, readoutW, r.Height), _rightTight);
+    }
+
+    /// <summary>Centre-origin axes read as a signed deviation, so centred shows 0 rather than 50.</summary>
+    private static string Readout(double value, bool centreOrigin) =>
+        centreOrigin ? $"{(value - 0.5) * 200:+0;-0;0}%" : $"{value * 100:0}%";
+
+    private static float MeasureText(Graphics g, string text, Font font) =>
+        g.MeasureString(text, font, PointF.Empty, StringFormat.GenericTypographic).Width;
 
     private void DrawButtons(Graphics g, RectangleF area, DeviceState state, int count, OverlayConfig config)
     {
@@ -599,6 +789,8 @@ internal sealed class OverlayRenderer : IDisposable
         _edge.Dispose(); _accentPen.Dispose(); _gridPen.Dispose();
         _fontTiny.Dispose(); _fontSmall.Dispose(); _fontTitle.Dispose();
         _cellFont?.Dispose(); _barFont?.Dispose();
+        DisposeModeResources();
         _centre.Dispose(); _centreTight.Dispose();
+        _leftTight.Dispose(); _rightTight.Dispose();
     }
 }
